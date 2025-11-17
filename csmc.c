@@ -2,6 +2,38 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <assert.h> // For assertions
+#include <time.h>   // For srand seeding
+#include <unistd.h> // For usleep
+
+// ---Global Shared Resources---
+
+//Inputs
+int num_students;
+int num_tutors;
+int num_chairs;
+int max_help;
+
+//FIFO Queue for Waiting Students
+int* waiting_queue;
+int waiting_count = 0;
+int queue_front = 0;
+int queue_rear = 0;
+
+//Shared data
+pthread_mutex_t mutex;
+int num_empty_chairs;
+int total_help_requests;        // requests to C
+int total_sessions_tutored;     // sessions by T 
+int current_tutoring_sessions;  // current sessions by T
+int students_finished_count;    
+int p_queue_total_count;
+volatile int shutdown_flag = 0;
+
+//Semaphores
+sem_t sem_student_arrived;              // Student signals Coord they are in arrival_fifo
+sem_t sem_student_waiting_in_pqueue;    // Coord signals Tutor a student is in p_queue
+sem_t sem_tutors_available;             // Semaphore for tutor "slots"
 
 // ---Simulation Times---
 #define PROGRAM_SLEEP_US 2000 // 0-2ms
@@ -20,6 +52,10 @@ typedef struct Queue {
     Node* tail;
     int count;
 } Queue;
+
+//Globally Shared Queues
+Queue arrival_fifo; // Students add themselves here (max size num_chairs)
+Queue* p_queues;    // Priority queues (array of Queues, size max_help)
 
 //Queue Helpers:
 void queue_init(Queue* q) {
@@ -88,43 +124,6 @@ void sleep_random(long max_us) {
     usleep(random_us);
 }
 
-// ---Global Shared Resources---
-
-//Queues
-Queue arrival_fifo; // Students add themselves here (max size num_chairs)
-Queue* p_queues;    // Priority queues (array of Queues, size max_help)
-
-//Inputs
-int num_students;
-int num_tutors;
-int num_chairs;
-int max_help;
-
-//FIFO Queue for Waiting Students
-int* waiting_queue;
-int waiting_count = 0;
-int queue_front = 0;
-int queue_rear = 0;
-
-//Shared data
-pthread_mutex_t mutex;
-int num_empty_chairs;
-int total_help_requests;        // requests to C
-int total_sessions_tutored;     // sessions by T 
-int current_tutoring_sessions;  // current sessions by T
-int students_finished_count;    
-int p_queue_total_count;
-volatile int shutdown_flag = 0;
-
-//Semaphores
-sem_t sem_student_arrived;              // Student signals Coord they are in arrival_fifo
-sem_t sem_student_waiting_in_pqueue;    // Coord signals Tutor a student is in p_queue
-sem_t sem_tutors_available;             // Semaphore for tutor "slots"
-
-//Thread Data (Global)
-StudentInfo* student_data;
-TutorInfo* tutor_data;
-
 // ---Student-Specific Data---
 typedef struct StudentInfo {
     int id;
@@ -139,6 +138,196 @@ typedef struct TutorInfo {
     int id;
 } TutorInfo;
 
+//Thread Data (Global)
+StudentInfo* student_data;
+TutorInfo* tutor_data;
+
+// --TUTOR THREAD--
+void* tutor_thread(void* arg) {
+    TutorInfo* me = (TutorInfo*)arg;
+    int my_id = me->id;
+
+    while(1){
+        //wait for student in p-queue
+        sem_wait(&sem_student_waiting_in_pqueue);
+        pthread_mutex_lock(&mutex);
+        //check shutdown flag
+        if(shutdown_flag){
+            if (p_queue_total_count == 0 && students_finished_count == num_students) {
+                // Propagate shutdown signal to other tutors
+                sem_post(&sem_student_waiting_in_pqueue);
+                pthread_mutex_unlock(&mutex);
+                break;
+            }
+            // there are still students, no one else is coming, wake up another tutor.
+            sem_post(&sem_student_waiting_in_pqueue);
+        }
+        // i was woken but there are no students
+        if (p_queue_total_count == 0) {
+            pthread_mutex_unlock(&mutex);
+            continue; // Go back to waiting
+        }
+
+        //Get tutor slot
+        pthread_mutex_unlock(&mutex); // Unlock to wait on semaphore
+        sem_wait(&sem_tutors_available);
+        pthread_mutex_lock(&mutex); // Re-lock
+
+        //Re-check p-queue (tutor might have grabbed them between my sem_wait and lock) and get highest priority student
+        if (p_queue_total_count == 0) {
+            sem_post(&sem_tutors_available); // Release the slot
+            pthread_mutex_unlock(&mutex);
+            continue; // Go back to waiting
+        }
+        //found student
+        int student_id = p_queue_dequeue();
+        assert(student_id != -1);
+        StudentInfo* student_to_help = &student_data[student_id];
+        //state management
+        student_to_help->current_tutor_id = my_id;
+        current_tutoring_sessions++;
+        total_sessions_tutored++;
+
+        //sanity checks
+        assert(total_sessions_tutored <= total_help_requests);
+        assert(current_tutoring_sessions <= num_tutors);
+
+        //message
+        printf("T: Student %d tutored by Tutor %d. Total sessions being tutored = %d. Total sessions tutored by all = %d.\n",
+                student_id, my_id, current_tutoring_sessions, total_sessions_tutored);
+        
+        //student has been claimed, unlock:
+        pthread_mutex_unlock(&mutex);
+
+        //signal *specific* student to start
+        sem_post(&student_to_help->sem_start_tutoring);
+        
+        //Simulate tutoring
+        usleep(TUTOR_SLEEP_US);
+
+        //Wait for student to signal they are done
+        sem_wait(&student_to_help->sem_finish_tutoring);
+
+        //Update state after tutoring
+        pthread_mutex_lock(&mutex);
+        current_tutoring_sessions--;
+        pthread_mutex_unlock(&mutex);
+
+        // 12. Release the "tutor slot"
+        sem_post(&sem_tutors_available);
+    
+    }
+    return NULL;
+}
+
+// --COORD THREAD--
+void* coord_thread(void* arg) {
+    (void)arg; // Unused
+
+    while(1){
+        //wait for student
+        sem_wait(&sem_student_arrived);
+        pthread_mutex_lock(&mutex);
+
+        //Check for shutdown signal
+        if (shutdown_flag) {
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
+
+        //Grab student from arrival_fifo
+        assert(arrival_fifo.count > 0);
+        int student_id = dequeue(&arrival_fifo);
+        int priority = student_data[student_id].visit_count; // 0-based
+
+        //Add student to the correct priority queue
+        p_queue_enqueue(student_id, priority);
+
+        total_help_requests++;
+        assert(p_queue_total_count <= num_chairs); //just making sure 
+
+        //Print coordinator message (with 1-based priority)
+        printf("C: Student %d with priority %d in queue. Waiting students = %d. Total help requested so far = %d.\n",
+               student_id, priority + 1, p_queue_total_count, total_help_requests);
+        
+        pthread_mutex_unlock(&mutex);
+
+        //Signal to idle tutors that a student is ready
+        sem_post(&sem_student_waiting_in_pqueue);
+    }
+    
+    //Propagate shutdown signal to any waiting tutors
+    sem_post(&sem_student_waiting_in_pqueue);
+    return NULL;
+}
+
+// --STUDENT THREAD--
+void* student_thread(void* arg) {
+    StudentInfo* me = (StudentInfo*)arg;
+    int my_id = me->id;
+
+    while(me->visit_count < max_help){
+        // do some programing
+        sleep_random(PROGRAM_SLEEP_US);
+
+        //try to get a chair
+        int chair_taken = 0;
+        pthread_mutex_lock(&mutex);
+        if (num_empty_chairs > 0) {
+            num_empty_chairs--;
+            printf("S: Student %d takes a seat. Empty chairs remaining = %d.\n",
+                   my_id, num_empty_chairs);
+            // Add myself to simple arrival FIFO
+            enqueue(&arrival_fifo, my_id);
+            chair_taken = 1;
+        } else {
+            printf("S: Student %d found no empty chair. Will come again later.\n", my_id);
+        }
+        pthread_mutex_unlock(&mutex);
+        
+        // once a chair is exclusively claimed...
+        if (chair_taken) {
+            //Signal Coordinator
+            sem_post(&sem_student_arrived);
+
+            //Wait for a tutor to signal me
+            sem_wait(&me->sem_start_tutoring);
+
+            // Woken up by tutor!
+            
+            // 5. Free the chair exclusively
+            pthread_mutex_lock(&mutex);
+            num_empty_chairs++;
+            // The tutor incremented current_tutoring_sessions
+            assert(current_tutoring_sessions <= num_tutors);
+            pthread_mutex_unlock(&mutex);
+
+            // 6. Receive help
+            printf("S: Student %d receives help from Tutor %d.\n", 
+                   my_id, me->current_tutor_id);
+            
+            // Simulate tutoring
+            usleep(TUTOR_SLEEP_US);
+
+            // 7. Signal tutor I am done
+            sem_post(&me->sem_finish_tutoring);
+
+            // 8. Update my visit count
+            me->visit_count++;
+        
+        } // else, loop again to "program" and "try later"
+
+    }
+
+    // Reached max_help, no one can help you now...
+    pthread_mutex_lock(&mutex);
+    students_finished_count++;
+    pthread_mutex_unlock(&mutex);
+    return NULL;
+    
+}
+
+// --MAIN--
 int main(int argc, char* argv[]) {
     // Validating and parsing inputs
     if (argc != 5) {
@@ -219,127 +408,48 @@ int main(int argc, char* argv[]) {
         pthread_join(student_threads[i], NULL);
     }
 
+    //Signal shutdown
+    pthread_mutex_lock(&mutex);
+    shutdown_flag = 1;
+    pthread_mutex_unlock(&mutex);
 
-
-
-}
-
-void* tutor_thread(void* arg) {
-    TutorInfo* me = (TutorInfo*)arg;
-    int my_id = me->id;
-
-    while(1){
-        //wait for student in p-queue
-        sem_wait(&sem_student_waiting_in_pqueue);
-        pthread_mutex_lock(&mutex);
-        //check shutdown flag
-        if(shutdown_flag){
-            if (p_queue_total_count == 0 && students_finished_count == num_students) {
-                // Propagate shutdown signal to other tutors
-                sem_post(&sem_student_waiting_in_pqueue);
-                pthread_mutex_unlock(&mutex);
-                break;
-            }
-            // there are still students, no one else is coming, wake up another tutor.
-            sem_post(&sem_student_waiting_in_pqueue);
-        }
-        // i was woken but there are no students
-        if (p_queue_total_count == 0) {
-            pthread_mutex_unlock(&mutex);
-            continue; // Go back to waiting
-        }
-
-        //Get tutor slot
-        pthread_mutex_unlock(&mutex); // Unlock to wait on semaphore
-        sem_wait(&sem_tutors_available);
-        pthread_mutex_lock(&mutex); // Re-lock
-
-        //Re-check p-queue (tutor might have grabbed them between my sem_wait and lock) and get highest priority student
-        if (p_queue_total_count == 0) {
-            sem_post(&sem_tutors_available); // Release the slot
-            pthread_mutex_unlock(&mutex);
-            continue; // Go back to waiting
-        }
-        //found student
-        int student_id = p_queue_dequeue();
-        assert(student_id != -1);
-        StudentInfo* student_to_help = &student_data[student_id];
-        //state management
-        student_to_help->current_tutor_id = my_id;
-        current_tutoring_sessions++;
-        total_sessions_tutored++;
-
-        //sanity checks
-        assert(total_sessions_tutored <= total_help_requests);
-        assert(current_tutoring_sessions <= num_tutors);
-
-        //message
-        printf("T: Student %d tutored by Tutor %d. Total sessions being tutored = %d. Total sessions tutored by all = %d.\n",
-                student_id, my_id, current_tutoring_sessions, total_sessions_tutored);
-        
-        //student has been claimed, unlock:
-        pthread_mutex_unlock(&mutex);
-
-        //signal *specific* student to start
-        sem_post(&student_to_help->sem_start_tutoring);
-        
-        //Simulate tutoring
-        usleep(TUTOR_SLEEP_US);
-
-        //Wait for student to signal they are done
-        sem_wait(&student_to_help->sem_finish_tutoring);
-
-        //Update state after tutoring
-        pthread_mutex_lock(&mutex);
-        current_tutoring_sessions--;
-        pthread_mutex_unlock(&mutex);
-
-        // 12. Release the "tutor slot"
-        sem_post(&sem_tutors_available);
-    
-    }
-    return NULL;
-}
-
-void* coord_thread(void* arg) {
-    while(1){
-        //wait for student
-        sem_wait(&sem_student_arrived);
-        pthread_mutex_lock(&mutex);
-
-        //Check for shutdown signal
-        if (shutdown_flag) {
-            pthread_mutex_unlock(&mutex);
-            break;
-        }
-
-        //Grab student from arrival_fifo
-        assert(arrival_fifo.count > 0);
-        int student_id = dequeue(&arrival_fifo);
-        int priority = student_data[student_id].visit_count; // 0-based
-
-        //Add student to the correct priority queue
-        p_queue_enqueue(student_id, priority);
-
-        total_help_requests++;
-        assert(p_queue_total_count <= num_chairs); //just making sure 
-
-        //Print coordinator message (with 1-based priority)
-        printf("C: Student %d with priority %d in queue. Waiting students = %d. Total help requested so far = %d.\n",
-               student_id, priority + 1, p_queue_total_count, total_help_requests);
-        
-        pthread_mutex_unlock(&mutex);
-
-        //Signal to idle tutors that a student is ready
+    // Wake up coordinator and tutors so they can exit
+    sem_post(&sem_student_arrived); // Wake coordinator
+    for (int i = 0; i < num_tutors; i++) {
+         // Wake all tutors
         sem_post(&sem_student_waiting_in_pqueue);
     }
+
+    // Join coordinator and tutors
+    pthread_join(coordinator_thread, NULL);
+    for (int i = 0; i < num_tutors; i++) {
+        pthread_join(tutor_threads[i], NULL);
+    }
+
+    //Cleanup
+    pthread_mutex_destroy(&mutex);
+    sem_destroy(&sem_student_arrived);
+    sem_destroy(&sem_student_waiting_in_pqueue);
+    sem_destroy(&sem_tutors_available);
+
+    for (int i = 0; i < num_students; i++) {
+        sem_destroy(&student_data[i].sem_start_tutoring);
+        sem_destroy(&student_data[i].sem_finish_tutoring);
+    }
     
-    //Propagate shutdown signal to any waiting tutors
-    sem_post(&sem_student_waiting_in_pqueue);
-    return NULL;
+    // Free P-Queues (linked list nodes were freed in dequeue)
+    for (int i = 0; i < max_help; i++) {
+        // Just in case any are left (shouldn't be)
+        while(p_queues[i].count > 0) dequeue(&p_queues[i]);
+    }
+    free(p_queues);
+
+    // Free main data arrays
+    free(student_data);
+    free(tutor_data);
+    free(student_threads);
+    free(tutor_threads);
+
+    return 0;
 }
 
-void* student_thread(void* arg) {
-    
-
-}
